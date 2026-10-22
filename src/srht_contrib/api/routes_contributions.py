@@ -35,20 +35,34 @@ def _resolve_range(year: int | None, from_date: str | None, to_date: str | None)
     raise HTTPException(status_code=400, detail="Provide `year` or both `from` and `to`.")
 
 
-@router.get("/{actor}", response_model=ContributionCalendarResponse)
-def get_contributions(
-    actor: str,
+def _contribution_range(
     year: int | None = Query(default=None, ge=1970, le=3000),
     from_date: str | None = Query(default=None, alias="from"),
     to_date: str | None = Query(default=None, alias="to"),
+) -> tuple[date, date]:
+    return _resolve_range(year, from_date, to_date)
+
+
+def _tracked_actor(
+    actor: str,
     prioritize_self: bool = Query(default=False),
     poller: PollerService = Depends(get_poller),
     db: Session = Depends(get_db),
     actor_identity_resolver: ActorIdentityResolver = Depends(get_actor_identity_resolver),
-) -> ContributionCalendarResponse:
-    start, end = _resolve_range(year, from_date, to_date)
+) -> str:
+    """The canonical actor, recorded as requested so the poller keeps it fresh."""
     canonical_actor = actor_identity_resolver.canonicalize(actor, db=db)
     poller.track_actor_request(db, canonical_actor, prioritize=prioritize_self)
+    return canonical_actor
+
+
+@router.get("/{actor}", response_model=ContributionCalendarResponse)
+def get_contributions(
+    date_range: tuple[date, date] = Depends(_contribution_range),
+    canonical_actor: str = Depends(_tracked_actor),
+    db: Session = Depends(get_db),
+) -> ContributionCalendarResponse:
+    start, end = date_range
     response = ContributionAggregator().build_calendar(db, canonical_actor, start, end)
     db.commit()
     return response
@@ -56,18 +70,11 @@ def get_contributions(
 
 @router.get("/{actor}/stats", response_model=ContributionStatsResponse)
 def get_contribution_stats(
-    actor: str,
-    year: int | None = Query(default=None, ge=1970, le=3000),
-    from_date: str | None = Query(default=None, alias="from"),
-    to_date: str | None = Query(default=None, alias="to"),
-    prioritize_self: bool = Query(default=False),
-    poller: PollerService = Depends(get_poller),
+    date_range: tuple[date, date] = Depends(_contribution_range),
+    canonical_actor: str = Depends(_tracked_actor),
     db: Session = Depends(get_db),
-    actor_identity_resolver: ActorIdentityResolver = Depends(get_actor_identity_resolver),
 ) -> ContributionStatsResponse:
-    start, end = _resolve_range(year, from_date, to_date)
-    canonical_actor = actor_identity_resolver.canonicalize(actor, db=db)
-    poller.track_actor_request(db, canonical_actor, prioritize=prioritize_self)
+    start, end = date_range
     response = ContributionAggregator().build_stats(db, canonical_actor, start, end)
     db.commit()
     return response

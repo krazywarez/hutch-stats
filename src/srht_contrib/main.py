@@ -17,7 +17,7 @@ from srht_contrib.db import make_engine, validate_db
 from srht_contrib.jobs.poller import PollerService
 from srht_contrib.logging import configure_logging
 from srht_contrib.services.git import GitIngestionService
-from srht_contrib.services.srht_client import SourceHutGraphQLClient
+from srht_contrib.services.srht_client import ClientOptions, SourceHutGraphQLClient
 from srht_contrib.services.todo import TodoIngestionService
 from srht_contrib.utils.identity import ActorIdentityResolver
 
@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 def build_poller(settings: Settings) -> PollerService:
-    todo_client = SourceHutGraphQLClient(settings.todo_srht_endpoint, settings.srht_token, request_delay=settings.srht_request_delay_seconds)
-    git_client = SourceHutGraphQLClient(settings.git_srht_endpoint, settings.srht_token, request_delay=settings.srht_request_delay_seconds)
+    client_options = ClientOptions(request_delay=settings.srht_request_delay_seconds)
+    todo_client = SourceHutGraphQLClient(settings.todo_srht_endpoint, settings.srht_token, options=client_options)
+    git_client = SourceHutGraphQLClient(settings.git_srht_endpoint, settings.srht_token, options=client_options)
     todo_service = TodoIngestionService(todo_client, settings)
     git_service = GitIngestionService(git_client, settings)
     return PollerService(todo_service=todo_service, git_service=git_service, settings=settings)

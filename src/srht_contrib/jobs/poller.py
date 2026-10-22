@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -20,6 +21,14 @@ from srht_contrib.utils.repositories import canonicalize_repository_name
 
 logger = logging.getLogger(__name__)
 RECENT_BACKFILL_BATCHES_PER_SERVICE = 5
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    scope: str
+    services: list
+    batches_per_service: int
+    since: datetime | None
 
 
 class PollerService:
@@ -293,11 +302,13 @@ class PollerService:
             tracked_actor.last_recent_backfill_error = None
             total_inserted += self._run_backfill_scope(
                 db,
-                actor=actor,
-                scope="recent",
-                services=recent_services,
-                batches_per_service=RECENT_BACKFILL_BATCHES_PER_SERVICE,
-                since=recent_since,
+                actor,
+                BackfillPlan(
+                    scope="recent",
+                    services=recent_services,
+                    batches_per_service=RECENT_BACKFILL_BATCHES_PER_SERVICE,
+                    since=recent_since,
+                ),
             )
             recent_statuses = db.scalars(
                 select(ServiceBackfillState.status)
@@ -313,40 +324,11 @@ class PollerService:
 
         return total_inserted
 
-    def _run_backfill_scope(
-        self,
-        db: Session,
-        *,
-        actor: str,
-        scope: str,
-        services,
-        batches_per_service: int,
-        since: datetime | None,
-    ) -> int:
+    def _run_backfill_scope(self, db: Session, actor: str, plan: BackfillPlan) -> int:
         tracked_actor = self.track_actor_request(db, actor, update_last_requested=False)
         total_inserted = 0
-        for service_name, fetcher in services:
-            state = db.scalar(
-                select(ServiceBackfillState)
-                .where(ServiceBackfillState.actor == actor)
-                .where(ServiceBackfillState.service == service_name)
-                .where(ServiceBackfillState.scope == scope)
-            )
-            if state is None:
-                state = ServiceBackfillState(
-                    actor=actor,
-                    service=service_name,
-                    scope=scope,
-                    cursor_json=None,
-                    status="pending",
-                    started_at=None,
-                    completed_at=None,
-                    last_error=None,
-                    updated_at=datetime.now(tz=UTC),
-                )
-                db.add(state)
-                db.flush()
-
+        for service_name, fetcher in plan.services:
+            state = self._backfill_state(db, actor, service_name, plan.scope)
             if state.status == "completed":
                 continue
 
@@ -355,49 +337,81 @@ class PollerService:
             state.status = "in_progress"
             state.updated_at = datetime.now(tz=UTC)
 
-            for _ in range(batches_per_service):
-                try:
-                    if since is None:
-                        result = fetcher(actor=actor, cursor_state=state.cursor_json)
-                    else:
-                        result = fetcher(actor=actor, cursor_state=state.cursor_json, since=since)
-                    inserted = self._insert_events(db, result.events)
-                    total_inserted += inserted
-                    state.cursor_json = copy.deepcopy(result.cursor_state)
-                    state.last_error = None
-                    state.updated_at = datetime.now(tz=UTC)
-                    if result.complete:
-                        state.status = "completed"
-                        state.completed_at = datetime.now(tz=UTC)
-                        logger.info(
-                            "Backfill complete for scope=%s service=%s actor=%s inserted=%s",
-                            scope,
-                            service_name,
-                            actor,
-                            inserted,
-                        )
-                        break
-                    logger.info(
-                        "Backfill batch complete for scope=%s service=%s actor=%s inserted=%s",
-                        scope,
-                        service_name,
-                        actor,
-                        inserted,
-                    )
-                except Exception as exc:
-                    state.status = "error"
-                    state.last_error = str(exc)
-                    state.updated_at = datetime.now(tz=UTC)
-                    tracked_actor.recent_backfill_status = "error"
-                    tracked_actor.last_recent_backfill_error = str(exc)
-                    db.add(state)
-                    db.add(tracked_actor)
-                    db.flush()
-                    raise
+            try:
+                total_inserted += self._run_service_batches(db, actor, state, fetcher, plan)
+            except Exception as exc:
+                state.status = "error"
+                state.last_error = str(exc)
+                state.updated_at = datetime.now(tz=UTC)
+                tracked_actor.recent_backfill_status = "error"
+                tracked_actor.last_recent_backfill_error = str(exc)
+                db.add(state)
+                db.add(tracked_actor)
+                db.flush()
+                raise
 
             db.add(state)
             db.flush()
 
+        return total_inserted
+
+    @staticmethod
+    def _backfill_state(db: Session, actor: str, service_name: str, scope: str) -> ServiceBackfillState:
+        state = db.scalar(
+            select(ServiceBackfillState)
+            .where(ServiceBackfillState.actor == actor)
+            .where(ServiceBackfillState.service == service_name)
+            .where(ServiceBackfillState.scope == scope)
+        )
+        if state is None:
+            state = ServiceBackfillState(
+                actor=actor,
+                service=service_name,
+                scope=scope,
+                cursor_json=None,
+                status="pending",
+                started_at=None,
+                completed_at=None,
+                last_error=None,
+                updated_at=datetime.now(tz=UTC),
+            )
+            db.add(state)
+            db.flush()
+        return state
+
+    def _run_service_batches(
+        self, db: Session, actor: str, state: ServiceBackfillState, fetcher, plan: BackfillPlan
+    ) -> int:
+        """Run up to plan.batches_per_service batches for one service; returns rows inserted."""
+        total_inserted = 0
+        for _ in range(plan.batches_per_service):
+            if plan.since is None:
+                result = fetcher(actor=actor, cursor_state=state.cursor_json)
+            else:
+                result = fetcher(actor=actor, cursor_state=state.cursor_json, since=plan.since)
+            inserted = self._insert_events(db, result.events)
+            total_inserted += inserted
+            state.cursor_json = copy.deepcopy(result.cursor_state)
+            state.last_error = None
+            state.updated_at = datetime.now(tz=UTC)
+            if result.complete:
+                state.status = "completed"
+                state.completed_at = datetime.now(tz=UTC)
+                logger.info(
+                    "Backfill complete for scope=%s service=%s actor=%s inserted=%s",
+                    plan.scope,
+                    state.service,
+                    actor,
+                    inserted,
+                )
+                break
+            logger.info(
+                "Backfill batch complete for scope=%s service=%s actor=%s inserted=%s",
+                plan.scope,
+                state.service,
+                actor,
+                inserted,
+            )
         return total_inserted
 
     def prune_old_events(self, db: Session) -> int:

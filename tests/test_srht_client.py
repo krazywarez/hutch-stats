@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from srht_contrib.services.srht_client import SourceHutClientError, SourceHutGraphQLClient
+from srht_contrib.services.srht_client import ClientOptions, SourceHutClientError, SourceHutGraphQLClient
 
 
 def test_graphql_client_retries_http_5xx_and_succeeds() -> None:
@@ -46,7 +46,7 @@ def test_graphql_client_raises_for_network_errors() -> None:
     client = SourceHutGraphQLClient(
         "https://todo.sr.ht/query",
         "token",
-        max_retries=0,
+        options=ClientOptions(max_retries=0),
         transport=httpx.MockTransport(handler),
     )
 
@@ -70,8 +70,7 @@ def test_graphql_client_applies_request_delay_and_retry_backoff(monkeypatch: pyt
     client = SourceHutGraphQLClient(
         "https://todo.sr.ht/query",
         "token",
-        max_retries=2,
-        request_delay=0.5,
+        options=ClientOptions(max_retries=2, request_delay=0.5),
         transport=httpx.MockTransport(handler),
     )
 
